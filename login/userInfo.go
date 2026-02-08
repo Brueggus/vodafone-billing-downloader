@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/cbrand/vodafone-billing-downloader/fetcher"
@@ -11,7 +12,10 @@ import (
 	"github.com/rodaine/table"
 )
 
-const USER_INFO_URL = "https://api.vodafone.de/meinvodafone/v2/user/userInfo"
+const (
+	USER_INFO_URL     = "https://api.vodafone.de/meinvodafone/v2/tmf-api/openid/v4/userinfo"
+	USER_INFO_API_KEY = "aEIoMCae0A933wBL0bLlS6SwSBfkKwM5"
+)
 
 var (
 	ErrUserInfoRequestFailed = errors.New("user info request failed")
@@ -22,127 +26,180 @@ var (
 
 func GetUserInfo(bearerToken fetcher.BearerToken) (*UserInfo, error) {
 	var userInfo UserInfo
-	err := fetcher.GetJson(USER_INFO_URL, bearerToken, &userInfo)
+	headers := map[string]string{
+		"x-api-key": USER_INFO_API_KEY,
+	}
+	err := fetcher.GetJsonWithHeaders(USER_INFO_URL, bearerToken, headers, &userInfo)
 	if err == fetcher.ErrJsonRequestFailed {
 		return nil, ErrUserInfoRequestFailed
 	}
 	return &userInfo, err
 }
 
-type UserInfo struct {
-	UserAccountVBO *UserAccountVBO `json:"userAccountVBO"`
-}
+type UserInfo []UserInfoEntry
 
 func (userInfo *UserInfo) HumanReadableString() string {
-	return fmt.Sprintf("=== User Account ===\n%s", userInfo.UserAccountVBO.HumanReadableString())
+	if userInfo == nil || len(*userInfo) == 0 {
+		return "=== User Account ===\n<empty>"
+	}
+
+	sections := []string{}
+	for i, entry := range *userInfo {
+		header := "=== User Account ==="
+		if i > 0 {
+			header = fmt.Sprintf("=== User Account (%d) ===", i+1)
+		}
+		sections = append(sections, header)
+		sections = append(sections, entry.HumanReadableString())
+	}
+
+	return strings.Join(sections, "\n")
 }
 
 func (userInfo *UserInfo) GetActiveContractCableID() string {
-	return userInfo.UserAccountVBO.GetActiveContractCableID()
+	contractIDs := userInfo.GetAllContractIDs()
+	if len(contractIDs) == 0 {
+		return ""
+	}
+	return contractIDs[0]
 }
 
 func (userInfo *UserInfo) GetAllContractIDs() []string {
-	return userInfo.UserAccountVBO.GetAllContractIDs()
-}
-
-type UserAccountVBO struct {
-	AuthLevel           string               `json:"authLevel"`
-	OnlineUser          *OnlineUser          `json:"onlineUser,omitempty"`
-	CableAccounts       []*CableAccount      `json:"cable,omitempty"`
-	ActiveContractCable *ActiveContractCable `json:"activeContractCable,omitempty"`
-}
-
-func (userAccountVBO *UserAccountVBO) HumanReadableString() string {
-	elements := []string{
-		userAccountVBO.OnlineUser.HumanReadableString(),
-		"=== Cable Accounts ===",
-		userAccountVBO.HumanReadableContractTable(),
-	}
-	return strings.Join(elements, "\n")
-}
-
-func (UserAccountVBO *UserAccountVBO) HumanReadableContractTable() string {
-	tbl := table.New("ID", "Name", "Active", "Number Subscriptions")
-	tbl.WithHeaderFormatter(headerFmt).WithFirstColumnFormatter(columnFmt)
-
-	for _, cableAccount := range UserAccountVBO.CableAccounts {
-		tbl.AddRow(cableAccount.ID, cableAccount.Name, cableAccount.IsActiveContract, len(cableAccount.Subscriptions))
+	if userInfo == nil {
+		return nil
 	}
 
-	data := bytes.NewBufferString("")
-	tbl.WithWriter(data).Print()
-	return data.String()
-}
-
-func (userAccountVBO *UserAccountVBO) GetActiveContractCableID() string {
-	if userAccountVBO.ActiveContractCable == nil {
-		return ""
+	ids := map[string]struct{}{}
+	for _, entry := range *userInfo {
+		for _, asset := range entry.UserAssets {
+			for _, id := range asset.ContractIDs() {
+				if id == "" {
+					continue
+				}
+				ids[id] = struct{}{}
+			}
+		}
 	}
-	return userAccountVBO.ActiveContractCable.IDString()
-}
 
-func (userAccountVBO *UserAccountVBO) GetAllContractIDs() []string {
-	var contractIDs []string
-	for _, cableAccount := range userAccountVBO.CableAccounts {
-		contractIDs = append(contractIDs, cableAccount.ID)
+	contractIDs := make([]string, 0, len(ids))
+	for id := range ids {
+		contractIDs = append(contractIDs, id)
 	}
+	sort.Strings(contractIDs)
 	return contractIDs
 }
 
-type OnlineUser struct {
-	MintUserID            int    `json:"mintUserId"`
-	UserName              string `json:"userName"`
-	Title                 string `json:"title"`
-	FirstName             string `json:"firstName"`
-	LastName              string `json:"lastName"`
-	LastLoginDate         string `json:"lastLoginDate"`
-	PrimaryEmail          string `json:"primaryEmail"`
-	EmailValidationStatus string `json:"emailValidationStatus"`
-	IsFirstLogin          bool   `json:"isFirstLogin"`
-	PermissionFlag        bool   `json:"permissionFlag"`
+type UserInfoEntry struct {
+	Title             string           `json:"title"`
+	LevelOfAssurance  string           `json:"levelOfAssurance"`
+	LastLoginDate     string           `json:"lastLoginDate"`
+	IsPreferredEmail  bool             `json:"isPreferredUsernameEmailAddress"`
+	Sub               string           `json:"sub"`
+	Name              string           `json:"name"`
+	Email             string           `json:"email"`
+	EmailVerified     bool             `json:"email_verified"`
+	GivenName         string           `json:"given_name"`
+	FamilyName        string           `json:"family_name"`
+	PreferredUsername string           `json:"preferred_username"`
+	UserAssets        []*UserAsset     `json:"userAssets"`
+	ExternalID        []*ExternalID    `json:"externalIdentifier"`
+	Credentials       *UserCredentials `json:"credentials"`
+	PhoneNumber       string           `json:"phoneNumber"`
+	PhoneVerified     bool             `json:"phone_number_verified"`
 }
 
-func (onlineUser *OnlineUser) HumanReadableString() string {
-	tbl := table.New("Name", "Value")
-	tbl.WithHeaderFormatter(headerFmt).WithFirstColumnFormatter(columnFmt)
+func (entry *UserInfoEntry) HumanReadableString() string {
+	profile := table.New("Field", "Value")
+	profile.WithHeaderFormatter(headerFmt).WithFirstColumnFormatter(columnFmt)
+	profile.AddRow("Name", entry.Name)
+	profile.AddRow("Email", entry.Email)
+	profile.AddRow("Preferred Username", entry.PreferredUsername)
+	profile.AddRow("Last Login", entry.LastLoginDate)
+	profile.AddRow("Level of Assurance", entry.LevelOfAssurance)
 
-	tbl.AddRow("MintUserID", onlineUser.MintUserID)
-	tbl.AddRow("UserName", onlineUser.UserName)
-	tbl.AddRow("Title", onlineUser.Title)
-	tbl.AddRow("FirstName", onlineUser.FirstName)
-	tbl.AddRow("LastName", onlineUser.LastName)
-	tbl.AddRow("LastLoginDate", onlineUser.LastLoginDate)
-	tbl.AddRow("PrimaryEmail", onlineUser.PrimaryEmail)
-	tbl.AddRow("EmailValidationStatus", onlineUser.EmailValidationStatus)
-	tbl.AddRow("IsFirstLogin", onlineUser.IsFirstLogin)
-	tbl.AddRow("PermissionFlag", onlineUser.PermissionFlag)
+	profileData := bytes.NewBufferString("")
+	profile.WithWriter(profileData).Print()
 
-	buffer := bytes.NewBufferString("")
-	tbl.WithWriter(buffer).Print()
-	return buffer.String()
+	assets := table.New("Contract ID", "Name", "Status", "Type")
+	assets.WithHeaderFormatter(headerFmt).WithFirstColumnFormatter(columnFmt)
+	for _, asset := range entry.UserAssets {
+		contractIDs := asset.ContractIDs()
+		if len(contractIDs) == 0 {
+			continue
+		}
+		for _, contractID := range contractIDs {
+			assets.AddRow(contractID, asset.Name, asset.Status, asset.AssetType)
+		}
+	}
+
+	assetsData := bytes.NewBufferString("")
+	assets.WithWriter(assetsData).Print()
+
+	sections := []string{
+		profileData.String(),
+		"=== Assets ===",
+		assetsData.String(),
+	}
+	return strings.Join(sections, "\n")
 }
 
-type CableAccount struct {
-	ID                string               `json:"id"`
-	Name              string               `json:"name"`
-	IsActiveContract  bool                 `json:"isActiveContract"`
-	IsDefaultContract bool                 `json:"isDefaultContract"`
-	HasCableMail      bool                 `json:"hasCableMail"`
-	Subscriptions     []*CableSubscription `json:"subscription"`
+type UserCredentials struct {
+	ID    string `json:"id"`
+	State string `json:"state"`
 }
 
-type CableSubscription struct {
-	ID            string `json:"id"`
-	ActivatedDate string `json:"activatedDate"`
-	Type          string `json:"type"`
-	DisplayName   string `json:"displayName"`
+type ExternalID struct {
+	ID    string `json:"id"`
+	Owner string `json:"owner"`
+	Type  string `json:"type"`
 }
 
-type ActiveContractCable struct {
-	ID   int    `json:"id"` // It is the same as `ID` in `CableSubscription` but as an integer because Vodafone is inconsistent
-	Name string `json:"name"`
+type UserAsset struct {
+	Name               string            `json:"name"`
+	Status             string            `json:"status"`
+	ID                 string            `json:"id"`
+	AssetType          string            `json:"assetType"`
+	EntityType         string            `json:"entityType"`
+	Role               string            `json:"role"`
+	ExternalIdentifier []*ExternalID     `json:"externalIdentifier"`
+	RelatedAsset       []*RelatedAsset   `json:"relatedAsset"`
+	Characteristic     []*Characteristic `json:"characteristic"`
 }
 
-func (activeContractCable *ActiveContractCable) IDString() string {
-	return fmt.Sprintf("%d", activeContractCable.ID)
+func (asset *UserAsset) ContractIDs() []string {
+	ids := []string{}
+	for _, external := range asset.ExternalIdentifier {
+		if external.Type == "customerNumber" {
+			ids = append(ids, external.ID)
+		}
+	}
+	if len(ids) > 0 {
+		return ids
+	}
+
+	for _, related := range asset.RelatedAsset {
+		for _, external := range related.ExternalIdentifier {
+			if external.Type == "accountNumber" {
+				ids = append(ids, external.ID)
+			}
+		}
+	}
+
+	return ids
+}
+
+type RelatedAsset struct {
+	Type               string            `json:"@type"`
+	Status             string            `json:"status"`
+	Name               string            `json:"name"`
+	ID                 string            `json:"id"`
+	AssetType          string            `json:"assetType"`
+	EntityType         string            `json:"entityType"`
+	ExternalIdentifier []*ExternalID     `json:"externalIdentifier"`
+	Characteristic     []*Characteristic `json:"characteristic"`
+}
+
+type Characteristic struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
 }

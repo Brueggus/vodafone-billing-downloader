@@ -18,11 +18,18 @@ var (
 )
 
 func GetJson(url string, bearerToken BearerToken, target interface{}) error {
+	return GetJsonWithHeaders(url, bearerToken, nil, target)
+}
+
+func GetJsonWithHeaders(url string, bearerToken BearerToken, headers map[string]string, target interface{}) error {
 	request, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
 	request = setJsonRequestHeaders(request)
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
 	request = bearerToken.AuthenticateAPI(request)
 	return jsonFromRequest(request, target)
 }
